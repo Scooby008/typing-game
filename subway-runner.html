@@ -1,0 +1,1250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Neon Dash — Endless Runner</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: #0a0a18; }
+  body {
+    font-family: "Trebuchet MS", "Segoe UI", system-ui, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+  }
+  #wrap { position: relative; width: 100vw; height: 100vh; }
+  canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game"></canvas>
+</div>
+<script>
+(function () {
+  "use strict";
+
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+
+  // ---------- Canvas / projection setup ----------
+  let W = 0, H = 0, DPR = 1;
+  let cx = 0, horizonY = 0, focal = 0;
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    cx = W / 2;
+    horizonY = H * 0.40;
+    focal = H * 0.92;
+    buildSkyline();
+  }
+  window.addEventListener("resize", resize);
+
+  // Camera
+  const CAM_Y = 2.6;
+  const CAM_Z = -6.5;
+
+  // World constants
+  const LANE_W = 2.4;
+  const LANES = [-LANE_W, 0, LANE_W];
+  const SPAWN_HORIZON = 88;
+
+  // project world (wx, wy, wz) -> screen {x, y, s}
+  let camX = 0;
+  function project(wx, wy, wz) {
+    const zc = wz - CAM_Z;               // always > 0 for wz >= 0
+    const s = focal / zc;
+    return {
+      x: cx + (wx - camX) * s,
+      y: horizonY - (wy - CAM_Y) * s,
+      s: s
+    };
+  }
+
+  // ---------- Audio (tiny synth, mirrors project style) ----------
+  let actx = null;
+  function ac() {
+    if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    return actx;
+  }
+  function beep(freq, dur, type, vol) {
+    const a = ac(); if (!a) return;
+    const o = a.createOscillator(), g = a.createGain();
+    o.type = type || "square";
+    o.frequency.value = freq;
+    g.gain.value = vol == null ? 0.06 : vol;
+    o.connect(g); g.connect(a.destination);
+    const t = a.currentTime;
+    o.start(t);
+    g.gain.setValueAtTime(g.gain.value, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.stop(t + dur);
+  }
+  const sfx = {
+    jump:  () => beep(520, 0.16, "square", 0.05),
+    land:  () => beep(200, 0.08, "sine", 0.05),
+    slide: () => beep(300, 0.18, "sawtooth", 0.04),
+    coin:  () => { beep(880, 0.07, "square", 0.05); setTimeout(() => beep(1320, 0.09, "square", 0.05), 60); },
+    crash: () => { beep(140, 0.4, "sawtooth", 0.09); beep(90, 0.5, "square", 0.07); },
+    start: () => { beep(440, 0.1, "square", 0.05); setTimeout(() => beep(660, 0.12, "square", 0.05), 90); },
+    power: () => { beep(660, 0.08, "square", 0.05); setTimeout(() => beep(880, 0.08, "square", 0.05), 70); setTimeout(() => beep(1180, 0.12, "square", 0.05), 140); },
+    shieldHit: () => { beep(520, 0.14, "square", 0.06); beep(260, 0.18, "sine", 0.05); }
+  };
+
+  // ---------- Game state ----------
+  const STATE = { MENU: 0, PLAY: 1, OVER: 2, PAUSE: 3 };
+  let state = STATE.MENU;
+
+  let speed, distance, coins, score, best;
+  best = parseInt(localStorage.getItem("neonDashBest") || "0", 10) || 0;
+
+  const player = {
+    lane: 1, x: 0, targetX: 0,
+    y: 0, vy: 0, onGround: true,
+    sliding: false, slideT: 0,
+    runPhase: 0
+  };
+
+  let objects = [];      // obstacles + coins
+  let shake = 0;
+  let flash = 0;         // coin pickup flash
+  let stripeOffset = 0;
+
+  const JUMP_V = 10.6;
+  const GRAV = 30;
+  const SLIDE_TIME = 0.55;
+
+  // ---------- Power-ups & skins ----------
+  const MAGNET_TIME = 6, MULT_TIME = 8;
+  let magnetT = 0, shieldOn = false, multT = 0;
+
+  let bank = parseInt(localStorage.getItem("neonDashBank") || "0", 10) || 0;
+  const SKINS = [
+    { name: "Cyan Classic", body: "#31e0ff", body2: "#1aa6d6", cap: "#ff4f8b", hair: "#6b4226", style: "ponytail", glow: "49,224,255",  cost: 0 },
+    { name: "Ember",        body: "#ff8a3c", body2: "#d24e12", cap: "#ffd23f", hair: "#7a3010", style: "braid",    glow: "255,138,60",  cost: 60 },
+    { name: "Toxic",        body: "#9dff3a", body2: "#4fb016", cap: "#12240a", hair: "#241f2b", style: "bob",      glow: "157,255,58",  cost: 140 },
+    { name: "Grape",        body: "#b06cff", body2: "#7a3fd0", cap: "#ffd23f", hair: "#3b2450", style: "buns",     glow: "176,108,255", cost: 240 },
+    { name: "Ghost",        body: "#eaf1ff", body2: "#9fb4d6", cap: "#31e0ff", hair: "#e6e2f0", style: "pigtails", glow: "232,240,255", cost: 400 }
+  ];
+  let owned;
+  try { owned = JSON.parse(localStorage.getItem("neonDashOwned") || "[0]"); } catch (e) { owned = [0]; }
+  if (!Array.isArray(owned) || !owned.length) owned = [0];
+  let equipped = parseInt(localStorage.getItem("neonDashSkin") || "0", 10) || 0;
+  if (!owned.includes(equipped)) equipped = owned[0];
+  let menuSkin = equipped;
+
+  function saveSkins() {
+    localStorage.setItem("neonDashOwned", JSON.stringify(owned));
+    localStorage.setItem("neonDashSkin", String(equipped));
+  }
+  function cycleSkin(dir) {
+    menuSkin = (menuSkin + dir + SKINS.length) % SKINS.length;
+    if (owned.includes(menuSkin)) { equipped = menuSkin; saveSkins(); }
+    beep(440, 0.05, "square", 0.03);
+  }
+  function buySkin() {
+    const s = SKINS[menuSkin];
+    if (owned.includes(menuSkin)) { equipped = menuSkin; saveSkins(); return; }
+    if (bank >= s.cost) {
+      bank -= s.cost; owned.push(menuSkin); equipped = menuSkin;
+      localStorage.setItem("neonDashBank", String(bank));
+      saveSkins();
+      beep(720, 0.1, "square", 0.06); setTimeout(() => beep(1080, 0.12, "square", 0.06), 90);
+    } else {
+      beep(150, 0.22, "sawtooth", 0.05); // can't afford
+    }
+  }
+  function activatePower(t) {
+    if (t === "magnet") magnetT = MAGNET_TIME;
+    else if (t === "shield") shieldOn = true;
+    else if (t === "mult") multT = MULT_TIME;
+    flash = Math.min(1, flash + 0.6);
+    sfx.power();
+  }
+
+  function reset() {
+    speed = 16;
+    distance = 0;
+    coins = 0;
+    score = 0;
+    objects = [];
+    shake = 0; flash = 0;
+    player.lane = 1; player.x = 0; player.targetX = 0;
+    player.y = 0; player.vy = 0; player.onGround = true;
+    player.sliding = false; player.slideT = 0; player.runPhase = 0;
+    magnetT = 0; shieldOn = false; multT = 0;
+    // seed a little clear runway then start spawning
+    lastPatternZ = 40;
+  }
+
+  function startGame() {
+    reset();
+    state = STATE.PLAY;
+    sfx.start();
+  }
+
+  // ---------- Input ----------
+  function moveLane(dir) {
+    if (state !== STATE.PLAY) return;
+    player.lane = Math.max(0, Math.min(2, player.lane + dir));
+    player.targetX = LANES[player.lane];
+  }
+  function doJump() {
+    if (state !== STATE.PLAY) return;
+    if (player.onGround && !player.sliding) {
+      player.vy = JUMP_V;
+      player.onGround = false;
+      sfx.jump();
+    }
+  }
+  function doSlide() {
+    if (state !== STATE.PLAY) return;
+    if (!player.sliding) {
+      player.sliding = true;
+      player.slideT = SLIDE_TIME;
+      if (!player.onGround) { player.vy = -18; } // fast-fall into slide
+      sfx.slide();
+    }
+  }
+
+  window.addEventListener("keydown", (e) => {
+    const k = e.key.toLowerCase();
+    if (["arrowup","arrowdown","arrowleft","arrowright"," "].includes(e.key.toLowerCase()) ||
+        [" "].includes(e.key)) e.preventDefault();
+    if (state === STATE.MENU || state === STATE.OVER) {
+      if (e.key === "Enter" || e.key === " ") { startGame(); return; }
+      if (k === "arrowleft" || k === "a") { cycleSkin(-1); return; }
+      if (k === "arrowright" || k === "d") { cycleSkin(1); return; }
+      if (k === "u") { buySkin(); return; }
+      return;
+    }
+    if (k === "arrowleft" || k === "a") moveLane(-1);
+    else if (k === "arrowright" || k === "d") moveLane(1);
+    else if (k === "arrowup" || k === "w" || e.key === " ") doJump();
+    else if (k === "arrowdown" || k === "s") doSlide();
+    else if (k === "p") { if (state === STATE.PLAY) state = STATE.PAUSE; else if (state === STATE.PAUSE) state = STATE.PLAY; }
+  }, { passive: false });
+
+  // Touch: swipe to steer/jump/slide, tap to start
+  let tsx = 0, tsy = 0, tst = 0, moved = false;
+  canvas.addEventListener("touchstart", (e) => {
+    const t = e.changedTouches[0];
+    tsx = t.clientX; tsy = t.clientY; tst = Date.now(); moved = false;
+  }, { passive: true });
+  canvas.addEventListener("touchend", (e) => {
+    const t = e.changedTouches[0];
+    const dx = t.clientX - tsx, dy = t.clientY - tsy;
+    const adx = Math.abs(dx), ady = Math.abs(dy);
+    if (state === STATE.MENU || state === STATE.OVER) {
+      if (adx > 40 && adx > ady) { cycleSkin(dx > 0 ? 1 : -1); return; } // swipe browses skins
+      startGame(); return;
+    }
+    if (adx < 24 && ady < 24) return; // tap (ignored mid-game)
+    if (adx > ady) moveLane(dx > 0 ? 1 : -1);
+    else if (dy < 0) doJump();
+    else doSlide();
+  }, { passive: true });
+  canvas.addEventListener("touchmove", (e) => { e.preventDefault(); }, { passive: false });
+
+  // ---------- Spawning ----------
+  let lastPatternZ = 40;
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const pick = (arr) => arr[(Math.random() * arr.length) | 0];
+
+  function difficulty() {
+    // 0 -> up as distance grows
+    return Math.min(1, distance / 2200);
+  }
+
+  function spawnPattern(z) {
+    const d = difficulty();
+    const roll = Math.random();
+
+    // choose obstacle layout that always leaves at least one lane clear
+    let blocked = []; // {lane, type}
+    if (roll < 0.28) {
+      // single low barrier -> JUMP
+      blocked.push({ lane: (Math.random() * 3) | 0, type: "barrier" });
+    } else if (roll < 0.48) {
+      // single overhead -> SLIDE
+      blocked.push({ lane: (Math.random() * 3) | 0, type: "overhead" });
+    } else if (roll < 0.66) {
+      // tall block -> must change lane
+      blocked.push({ lane: (Math.random() * 3) | 0, type: "block" });
+    } else if (roll < 0.84 && d > 0.15) {
+      // two lanes blocked (mixed), leave one open
+      const open = (Math.random() * 3) | 0;
+      for (let l = 0; l < 3; l++) if (l !== open) blocked.push({ lane: l, type: pick(["barrier","block","overhead"]) });
+    } else {
+      // barrier you can jump across two lanes
+      const open = (Math.random() * 3) | 0;
+      const t = pick(["barrier","overhead"]);
+      for (let l = 0; l < 3; l++) if (l !== open) blocked.push({ lane: l, type: t });
+    }
+
+    for (const b of blocked) objects.push(makeObstacle(b.type, b.lane, z));
+
+    // coins: a run in one of the open lanes
+    const openLanes = [0,1,2].filter(l => !blocked.some(b => b.lane === l));
+    if (openLanes.length && Math.random() < 0.85) {
+      const lane = pick(openLanes);
+      const n = 3 + ((Math.random() * 4) | 0);
+      const arc = Math.random() < 0.4; // coins arcing up (reward for jumping)
+      for (let i = 0; i < n; i++) {
+        const cz = z + (i - (n - 1) / 2) * 2.0;
+        let cy = 0.9;
+        if (arc) cy = 0.9 + Math.sin((i / (n - 1)) * Math.PI) * 2.4;
+        objects.push({ kind: "coin", lane, x: LANES[lane], z: cz, y: cy, checked: false, spin: Math.random() * 6 });
+      }
+    }
+
+    // occasional power-up floating in an open lane
+    if (openLanes.length && Math.random() < 0.13) {
+      const lane = pick(openLanes);
+      const ptype = pick(["magnet", "shield", "mult"]);
+      objects.push({ kind: "power", ptype, lane, z: z, y: 1.35, checked: false, spin: Math.random() * 6 });
+    }
+  }
+
+  function makeObstacle(type, lane, z) {
+    const o = { kind: "obs", type, lane, z, checked: false };
+    return o;
+  }
+
+  function maybeSpawn() {
+    // lastPatternZ is the z of the last spawned row; it drifts toward the
+    // camera each frame (see update), so keep laying down rows ahead of it.
+    while (lastPatternZ < SPAWN_HORIZON) {
+      const d = difficulty();
+      const gap = rand(13 - d * 4.5, 16 - d * 5);
+      lastPatternZ += gap;
+      spawnPattern(lastPatternZ);
+    }
+  }
+
+  // ---------- Collision ----------
+  function inLane(lane) {
+    return Math.abs(player.x - LANES[lane]) < LANE_W * 0.6;
+  }
+
+  function checkObject(o) {
+    if (o.kind === "coin") {
+      const near = Math.abs(player.x - o.x) < LANE_W * 0.6;
+      if (near) {
+        const feet = player.y;
+        const head = feet + (player.sliding ? 1.1 : 2.1);
+        if (o.y >= feet - 0.7 && o.y <= head + 0.5) {
+          o.collected = true;
+          coins++;
+          score += 15 * (multT > 0 ? 2 : 1);
+          flash = Math.min(1, flash + 0.4);
+          sfx.coin();
+        }
+      }
+      return;
+    }
+    if (o.kind === "power") {
+      if (inLane(o.lane)) { o.collected = true; activatePower(o.ptype); }
+      return;
+    }
+    // obstacle
+    if (!inLane(o.lane)) return;
+    let hit = false;
+    if (o.type === "barrier") {
+      // low hurdle, height ~1.0 -> must be jumping above it
+      if (player.y < 0.95) hit = true;
+    } else if (o.type === "overhead") {
+      // bar up high -> must slide under
+      if (!player.sliding) hit = true;
+    } else if (o.type === "block") {
+      // tall solid -> must not be in this lane
+      hit = true;
+    }
+    if (hit) crash();
+  }
+
+  function crash() {
+    if (state !== STATE.PLAY) return;
+    if (shieldOn) {           // absorb one hit
+      shieldOn = false;
+      shake = 0.6;
+      flash = Math.min(1, flash + 0.4);
+      sfx.shieldHit();
+      return;
+    }
+    state = STATE.OVER;
+    shake = 1;
+    sfx.crash();
+    bank += coins;            // collected coins bank toward skins
+    localStorage.setItem("neonDashBank", String(bank));
+    if (score > best) { best = Math.floor(score); localStorage.setItem("neonDashBest", String(best)); }
+  }
+
+  // ---------- Update ----------
+  let lastT = performance.now();
+  function update(dt) {
+    if (state !== STATE.PLAY) {
+      // gentle idle drift of stripes on menu
+      if (state === STATE.MENU) stripeOffset = (stripeOffset + dt * 6) % 4;
+      shake *= 0.9;
+      flash *= 0.9;
+      return;
+    }
+
+    // speed ramp
+    speed = Math.min(38, speed + dt * 0.55);
+    const move = speed * dt;
+    distance += move;
+    lastPatternZ -= move; // spawn cursor drifts toward the camera with the world
+    score += move * (multT > 0 ? 2 : 1); // distance points (coin points added on pickup)
+
+    stripeOffset = (stripeOffset + move) % 4;
+    player.runPhase += dt * (8 + speed * 0.35);
+
+    // horizontal lane lerp
+    player.x += (player.targetX - player.x) * Math.min(1, dt * 14);
+
+    // camera slight follow
+    camX += (player.x * 0.35 - camX) * Math.min(1, dt * 6);
+
+    // vertical physics
+    if (!player.onGround) {
+      player.vy -= GRAV * dt;
+      player.y += player.vy * dt;
+      if (player.y <= 0) { player.y = 0; player.vy = 0; player.onGround = true; sfx.land(); }
+    }
+    // slide timer
+    if (player.sliding) {
+      player.slideT -= dt;
+      if (player.slideT <= 0) player.sliding = false;
+    }
+
+    // power-up timers
+    if (magnetT > 0) magnetT = Math.max(0, magnetT - dt);
+    if (multT > 0) multT = Math.max(0, multT - dt);
+
+    // move objects toward camera, check + cull
+    for (let i = objects.length; i-- > 0;) {
+      const o = objects[i];
+      o.z -= move;
+      if (o.kind === "coin") {
+        o.spin += dt * 6;
+        // magnet: curve nearby coins toward the player so they get collected
+        if (magnetT > 0 && o.z < 24 && o.z > -1 && !o.collected) {
+          const k = Math.min(1, dt * 4);
+          o.x += (player.x - o.x) * k;
+          o.y += (0.9 - o.y) * k;
+        }
+      } else if (o.kind === "power") {
+        o.spin += dt * 3.5;
+      }
+      if (!o.checked && o.z < 0.25) {
+        o.checked = true;
+        checkObject(o);
+      }
+      if (o.collected || o.z < CAM_Z - 1) objects.splice(i, 1);
+    }
+
+    maybeSpawn();
+
+    shake *= 0.88;
+    flash *= 0.86;
+  }
+
+  // ---------- Rendering ----------
+  let skyline = [];
+  function buildSkyline() {
+    skyline = [];
+    let x = -50;
+    let seed = 12345;
+    const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+    while (x < W + 50) {
+      const w = 30 + rnd() * 60;
+      const h = 40 + rnd() * 160;
+      skyline.push({ x, w, h, lit: rnd() });
+      x += w + rnd() * 12;
+    }
+  }
+
+  function drawBackground() {
+    // sky gradient
+    const g = ctx.createLinearGradient(0, 0, 0, horizonY);
+    g.addColorStop(0, "#1a1440");
+    g.addColorStop(0.55, "#3b1e63");
+    g.addColorStop(0.82, "#8a2f6a");
+    g.addColorStop(1, "#f0724a");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, horizonY + 2);
+
+    // sun
+    const sunY = horizonY - 46;
+    const sg = ctx.createRadialGradient(cx, sunY, 4, cx, sunY, 70);
+    sg.addColorStop(0, "#ffe7a0");
+    sg.addColorStop(0.5, "#ffb057");
+    sg.addColorStop(1, "rgba(255,120,80,0)");
+    ctx.fillStyle = sg;
+    ctx.beginPath(); ctx.arc(cx, sunY, 70, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#ffcf7a";
+    ctx.beginPath(); ctx.arc(cx, sunY, 34, 0, Math.PI * 2); ctx.fill();
+
+    // skyline silhouette (parallax on camX)
+    const par = -camX * 6;
+    ctx.fillStyle = "#241543";
+    for (const b of skyline) {
+      const bx = b.x + par;
+      ctx.fillRect(bx, horizonY - b.h, b.w, b.h);
+      // a few lit windows
+      ctx.fillStyle = "rgba(255,214,140,0.55)";
+      for (let wy = horizonY - b.h + 8; wy < horizonY - 6; wy += 14) {
+        for (let wx = bx + 5; wx < bx + b.w - 5; wx += 12) {
+          if (((wx + wy) * (b.lit + 0.3)) % 7 < 2) ctx.fillRect(wx, wy, 4, 6);
+        }
+      }
+      ctx.fillStyle = "#241543";
+    }
+
+    // ground base
+    ctx.fillStyle = "#141024";
+    ctx.fillRect(0, horizonY, W, H - horizonY);
+  }
+
+  function roadEdgeX(z, side) {
+    // side = -1 left edge, +1 right edge of full road
+    return project(side * (LANE_W * 1.5 + 0.6), 0, z);
+  }
+
+  function drawRoad() {
+    // road trapezoid
+    const nearL = roadEdgeX(0, -1), nearR = roadEdgeX(0, 1);
+    const farL = roadEdgeX(SPAWN_HORIZON, -1), farR = roadEdgeX(SPAWN_HORIZON, 1);
+    ctx.beginPath();
+    ctx.moveTo(farL.x, farL.y);
+    ctx.lineTo(farR.x, farR.y);
+    ctx.lineTo(nearR.x, H);
+    ctx.lineTo(nearL.x, H);
+    ctx.closePath();
+    ctx.fillStyle = "#20203a";
+    ctx.fill();
+
+    // moving depth stripes for speed sensation
+    for (let i = 0; i < 46; i++) {
+      const z0 = i * 4 - stripeOffset;
+      const z1 = z0 + 2;
+      if (z1 < 0) continue;
+      if (z0 > SPAWN_HORIZON) break;
+      const l0 = roadEdgeX(Math.max(0, z0), -1), r0 = roadEdgeX(Math.max(0, z0), 1);
+      const l1 = roadEdgeX(z1, -1), r1 = roadEdgeX(z1, 1);
+      ctx.beginPath();
+      ctx.moveTo(l0.x, l0.y); ctx.lineTo(r0.x, r0.y);
+      ctx.lineTo(r1.x, r1.y); ctx.lineTo(l1.x, l1.y);
+      ctx.closePath();
+      ctx.fillStyle = (i % 2 === 0) ? "rgba(255,255,255,0.028)" : "rgba(0,0,0,0.10)";
+      ctx.fill();
+    }
+
+    // lane divider dashes (neon)
+    ctx.strokeStyle = "rgba(120,240,255,0.55)";
+    ctx.lineWidth = 2;
+    for (const dx of [-LANE_W / 2, LANE_W / 2]) {
+      for (let i = 0; i < 40; i++) {
+        const z0 = i * 3 - (stripeOffset * 0.75) % 3;
+        const z1 = z0 + 1.4;
+        if (z1 < 0) continue;
+        if (z0 > SPAWN_HORIZON) break;
+        const p0 = project(dx, 0.01, Math.max(0, z0));
+        const p1 = project(dx, 0.01, z1);
+        ctx.beginPath(); ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y); ctx.stroke();
+      }
+    }
+
+    // glowing side rails
+    ctx.strokeStyle = "rgba(255,80,160,0.7)";
+    ctx.lineWidth = 3;
+    for (const side of [-1, 1]) {
+      const a = project(side * (LANE_W * 1.5 + 0.6), 0.05, 0.2);
+      const b = project(side * (LANE_W * 1.5 + 0.6), 0.05, SPAWN_HORIZON);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+  }
+
+  function drawBox(lane, z, y0, h, halfW, depth, cFront, cTop, cSide) {
+    const lx = LANES[lane];
+    // corners: front (z) and back (z+depth)
+    const fbl = project(lx - halfW, y0, z);
+    const fbr = project(lx + halfW, y0, z);
+    const ftl = project(lx - halfW, y0 + h, z);
+    const ftr = project(lx + halfW, y0 + h, z);
+    const bbr = project(lx + halfW, y0, z + depth);
+    const btr = project(lx + halfW, y0 + h, z + depth);
+    const btl = project(lx - halfW, y0 + h, z + depth);
+
+    // top face
+    ctx.fillStyle = cTop;
+    ctx.beginPath();
+    ctx.moveTo(ftl.x, ftl.y); ctx.lineTo(ftr.x, ftr.y);
+    ctx.lineTo(btr.x, btr.y); ctx.lineTo(btl.x, btl.y);
+    ctx.closePath(); ctx.fill();
+
+    // right side face
+    ctx.fillStyle = cSide;
+    ctx.beginPath();
+    ctx.moveTo(fbr.x, fbr.y); ctx.lineTo(ftr.x, ftr.y);
+    ctx.lineTo(btr.x, btr.y); ctx.lineTo(bbr.x, bbr.y);
+    ctx.closePath(); ctx.fill();
+
+    // front face
+    ctx.fillStyle = cFront;
+    ctx.beginPath();
+    ctx.moveTo(fbl.x, fbl.y); ctx.lineTo(fbr.x, fbr.y);
+    ctx.lineTo(ftr.x, ftr.y); ctx.lineTo(ftl.x, ftl.y);
+    ctx.closePath(); ctx.fill();
+  }
+
+  function drawObstacle(o) {
+    if (o.type === "barrier") {
+      drawBox(o.lane, o.z, 0, 1.0, 1.05, 0.7, "#ff5d5d", "#ff9a9a", "#c23a3a");
+      // warning stripes
+      const p = project(LANES[o.lane], 0.5, o.z);
+      ctx.fillStyle = "rgba(255,255,255,0.85)";
+      ctx.font = `bold ${Math.max(8, p.s * 0.35)}px Trebuchet MS`;
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    } else if (o.type === "block") {
+      drawBox(o.lane, o.z, 0, 3.0, 1.1, 1.6, "#4a5b8f", "#7a8dd0", "#2f3c66");
+      // train "windows"
+      const wtop = project(LANES[o.lane], 2.1, o.z);
+      ctx.fillStyle = "rgba(150,230,255,0.7)";
+      const ww = wtop.s * 0.6, wh = wtop.s * 0.5;
+      ctx.fillRect(wtop.x - ww / 2, wtop.y - wh / 2, ww, wh);
+    } else if (o.type === "overhead") {
+      // bar up high; slide under. gap from 1.6 to 2.8
+      drawBox(o.lane, o.z, 1.6, 1.2, 1.15, 0.6, "#ffb648", "#ffd591", "#c78620");
+      // legs
+      for (const s of [-1, 1]) {
+        const a = project(LANES[o.lane] + s * 1.0, 0, o.z);
+        const b = project(LANES[o.lane] + s * 1.0, 1.6, o.z);
+        ctx.strokeStyle = "#c78620"; ctx.lineWidth = Math.max(2, a.s * 0.12);
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+      }
+    }
+  }
+
+  function drawCoin(o) {
+    const p = project(o.x, o.y, o.z);
+    const r = p.s * 0.34;
+    if (r < 1) return;
+    const wobble = Math.abs(Math.cos(o.spin)); // spin flatten
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.scale(0.35 + 0.65 * wobble, 1);
+    const cg = ctx.createRadialGradient(-r * 0.3, -r * 0.3, r * 0.1, 0, 0, r);
+    cg.addColorStop(0, "#fff6c0");
+    cg.addColorStop(0.6, "#ffd23f");
+    cg.addColorStop(1, "#e09b12");
+    ctx.fillStyle = cg;
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    // glow ring
+    ctx.strokeStyle = "rgba(255,220,120,0.5)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(p.x, p.y, r * (0.35 + 0.65 * wobble) + 2, 0, Math.PI * 2); ctx.stroke();
+  }
+
+  const POWER_COL = { magnet: "#ff4fa3", shield: "#41d0ff", mult: "#ffd23f" };
+  const POWER_SYM = { magnet: "M", shield: "S", mult: "2×" };
+  function drawPower(o) {
+    const p = project(LANES[o.lane], o.y, o.z);
+    const r = p.s * 0.5;
+    if (r < 1) return;
+    const col = POWER_COL[o.ptype];
+    const pulse = 1 + 0.12 * Math.sin(o.spin * 2.5);
+    // halo
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    const g = ctx.createRadialGradient(p.x, p.y, 1, p.x, p.y, r * 2.4);
+    g.addColorStop(0, "rgba(255,255,255,0.35)");
+    g.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(p.x, p.y, r * 2.4, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    // orb
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(p.x, p.y, r * pulse, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = Math.max(1, r * 0.08);
+    ctx.beginPath(); ctx.arc(p.x, p.y, r * pulse, 0, Math.PI * 2); ctx.stroke();
+    // symbol
+    ctx.fillStyle = "#fff";
+    ctx.font = `bold ${Math.max(9, r * 0.95)}px Trebuchet MS`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(POWER_SYM[o.ptype], p.x, p.y + r * 0.05);
+    ctx.textBaseline = "alphabetic";
+  }
+
+  function drawPlayer() {
+    const feet = project(player.x, player.y, 0);
+    const s = feet.s;
+    const bx = feet.x;
+    const groundY = project(player.x, 0, 0).y;
+
+    // shadow (shrinks when airborne)
+    const shH = Math.max(0.15, 1 - player.y / 4);
+    ctx.fillStyle = `rgba(0,0,0,${0.35 * shH})`;
+    ctx.beginPath();
+    ctx.ellipse(bx, groundY, s * 0.55 * shH, s * 0.16 * shH, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // shield bubble (covers both poses)
+    if (shieldOn) {
+      const a = 0.5 + 0.25 * Math.sin(performance.now() / 110);
+      ctx.strokeStyle = `rgba(65,208,255,${a})`;
+      ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.arc(bx, groundY - s * 0.7, s * 0.95, 0, Math.PI * 2); ctx.stroke();
+    }
+
+    const sk = SKINS[equipped];
+    const c1 = sk.body, c2 = sk.body2, hairCol = sk.hair;
+    const skinTone = "#f4c1a0", skinShade = "#e2a988";
+    const swing = Math.sin(player.runPhase) * (player.onGround ? 1 : 0.35);
+
+    if (player.sliding) {
+      // crouched / sliding pose, cartoon girl seen from behind
+      const y = groundY;
+      // hair streaming back with the wind — varies per style
+      ctx.strokeStyle = hairCol; ctx.lineCap = "round";
+      const st = sk.style;
+      if (st === "pigtails") {
+        ctx.lineWidth = s * 0.12;
+        ctx.beginPath(); ctx.moveTo(bx + s * 0.2, y - s * 0.58); ctx.quadraticCurveTo(bx - s * 0.3, y - s * 0.82, bx - s * 0.72, y - s * 0.66); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(bx + s * 0.2, y - s * 0.5); ctx.quadraticCurveTo(bx - s * 0.35, y - s * 0.62, bx - s * 0.78, y - s * 0.46); ctx.stroke();
+      } else if (st === "bob" || st === "buns") {
+        ctx.fillStyle = hairCol;
+        ctx.beginPath(); ctx.ellipse(bx + s * 0.14, y - s * 0.52, s * 0.2, s * 0.15, 0, 0, Math.PI * 2); ctx.fill();
+        if (st === "buns") {
+          ctx.beginPath(); ctx.arc(bx + s * 0.3, y - s * 0.68, s * 0.12, 0, Math.PI * 2); ctx.fill();
+        }
+      } else { // ponytail / braid
+        ctx.lineWidth = s * 0.17;
+        ctx.beginPath();
+        ctx.moveTo(bx + s * 0.18, y - s * 0.55);
+        ctx.quadraticCurveTo(bx - s * 0.35, y - s * 0.78, bx - s * 0.8, y - s * 0.55);
+        ctx.stroke();
+        if (st === "braid") {
+          ctx.fillStyle = hairCol;
+          for (let i = 0; i < 4; i++) {
+            const t = i / 3;
+            ctx.beginPath();
+            ctx.ellipse(bx + s * (0.18 - 0.98 * t), y - s * (0.55 + 0.18 * Math.sin(t * Math.PI)), s * (0.13 - 0.06 * t), s * 0.1, 0, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+      }
+      // legs tucked forward (skin)
+      ctx.strokeStyle = skinTone; ctx.lineWidth = s * 0.14; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(bx + s * 0.05, y - s * 0.18); ctx.lineTo(bx + s * 0.62, y - s * 0.06); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(bx + s * 0.05, y - s * 0.24); ctx.lineTo(bx + s * 0.5, y - s * 0.02); ctx.stroke();
+      // shoe
+      ctx.fillStyle = sk.cap;
+      ctx.beginPath(); ctx.ellipse(bx + s * 0.64, y - s * 0.05, s * 0.11, s * 0.07, 0, 0, Math.PI * 2); ctx.fill();
+      // flared skirt
+      ctx.fillStyle = c2;
+      ctx.beginPath(); ctx.ellipse(bx - s * 0.18, y - s * 0.28, s * 0.28, s * 0.18, -0.15, 0, Math.PI * 2); ctx.fill();
+      // top / torso
+      ctx.fillStyle = c1;
+      ctx.beginPath(); ctx.ellipse(bx + s * 0.02, y - s * 0.4, s * 0.42, s * 0.26, -0.12, 0, Math.PI * 2); ctx.fill();
+      // head (hair, back view)
+      ctx.fillStyle = hairCol;
+      ctx.beginPath(); ctx.arc(bx + s * 0.34, y - s * 0.52, s * 0.21, 0, Math.PI * 2); ctx.fill();
+      // hair tie
+      ctx.fillStyle = sk.cap;
+      ctx.beginPath(); ctx.arc(bx + s * 0.19, y - s * 0.55, s * 0.055, 0, Math.PI * 2); ctx.fill();
+      drawPlayerGlow(bx, y - s * 0.35, s);
+      return;
+    }
+
+    // ---- running pose: cartoon girl from behind ----
+    const rH = s * 0.27;                 // head radius
+    const headCY = groundY - s * 1.52;   // head center
+    const shoulderY = groundY - s * 1.24;
+    const waistY = groundY - s * 0.92;
+    const hipY = groundY - s * 0.76;
+    const legL = "#f4c1a0", legR = skinShade; // slight shade diff for depth
+
+    // legs (skin) — alternating stride
+    const lf = bx + swing * s * 0.34, lfY = groundY - Math.max(0, -swing) * s * 0.14;
+    const rf = bx - swing * s * 0.34, rfY = groundY - Math.max(0, swing) * s * 0.14;
+    ctx.lineCap = "round"; ctx.lineWidth = s * 0.15;
+    ctx.strokeStyle = legR;
+    ctx.beginPath(); ctx.moveTo(bx + s * 0.09, hipY); ctx.lineTo(rf, rfY); ctx.stroke();
+    ctx.strokeStyle = legL;
+    ctx.beginPath(); ctx.moveTo(bx - s * 0.09, hipY); ctx.lineTo(lf, lfY); ctx.stroke();
+    // sneakers
+    ctx.fillStyle = sk.cap;
+    for (const f of [[rf, rfY], [lf, lfY]]) {
+      ctx.beginPath(); ctx.ellipse(f[0], f[1], s * 0.12, s * 0.07, 0, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // flared skirt (accent color)
+    ctx.fillStyle = c2;
+    ctx.beginPath();
+    ctx.moveTo(bx - s * 0.22, waistY);
+    ctx.lineTo(bx + s * 0.22, waistY);
+    ctx.quadraticCurveTo(bx + s * 0.4, hipY, bx + s * 0.34, hipY + s * 0.08);
+    ctx.lineTo(bx - s * 0.34, hipY + s * 0.08);
+    ctx.quadraticCurveTo(bx - s * 0.4, hipY, bx - s * 0.22, waistY);
+    ctx.closePath(); ctx.fill();
+
+    // torso / top (body color)
+    ctx.fillStyle = c1;
+    roundRect(bx - s * 0.23, shoulderY, s * 0.46, waistY - shoulderY + s * 0.05, s * 0.14); ctx.fill();
+    // little collar highlight
+    ctx.fillStyle = "rgba(255,255,255,0.12)";
+    roundRect(bx - s * 0.23, shoulderY, s * 0.46, s * 0.09, s * 0.05); ctx.fill();
+
+    // arms (skin) with short sleeves, swinging opposite to legs
+    ctx.strokeStyle = skinTone; ctx.lineWidth = s * 0.12;
+    const shY = shoulderY + s * 0.06;
+    ctx.beginPath(); ctx.moveTo(bx - s * 0.2, shY); ctx.lineTo(bx - s * 0.26 + swing * s * 0.28, shY + s * 0.42); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(bx + s * 0.2, shY); ctx.lineTo(bx + s * 0.26 - swing * s * 0.28, shY + s * 0.42); ctx.stroke();
+    ctx.fillStyle = c1; // sleeve caps
+    ctx.beginPath(); ctx.arc(bx - s * 0.2, shY, s * 0.1, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(bx + s * 0.2, shY, s * 0.1, 0, Math.PI * 2); ctx.fill();
+
+    // flowing hair down the back — style-specific (drawn over the torso)
+    const sway = Math.sin(player.runPhase * 0.9) * s * 0.16;
+    drawBackHairTails(sk, bx, headCY, rH, waistY, s, sway);
+
+    // neck
+    ctx.fillStyle = skinShade;
+    ctx.fillRect(bx - s * 0.06, headCY + rH * 0.55, s * 0.12, s * 0.14);
+
+    // head — hair from behind
+    ctx.fillStyle = hairCol;
+    ctx.beginPath(); ctx.arc(bx, headCY, rH, 0, Math.PI * 2); ctx.fill();
+    // soft hair highlight
+    ctx.strokeStyle = "rgba(255,255,255,0.16)"; ctx.lineWidth = s * 0.05;
+    ctx.beginPath(); ctx.arc(bx - rH * 0.3, headCY - rH * 0.15, rH * 0.55, Math.PI * 0.85, Math.PI * 1.55); ctx.stroke();
+    // buns / ties that sit on top of the head (drawn after it)
+    drawBackHairTop(sk, bx, headCY, rH, s, sway);
+
+    drawPlayerGlow(bx, (shoulderY + groundY) / 2, s);
+  }
+
+  // Hair that hangs down the back, varies per skin.style (drawn before the head)
+  function drawBackHairTails(sk, bx, headCY, rH, waistY, s, sway) {
+    const hairCol = sk.hair;
+    ctx.strokeStyle = hairCol; ctx.lineCap = "round";
+    const midY = (headCY + waistY) / 2;
+    const style = sk.style;
+
+    if (style === "ponytail") {
+      ctx.lineWidth = s * 0.2;
+      ctx.beginPath();
+      ctx.moveTo(bx, headCY - rH * 0.2);
+      ctx.quadraticCurveTo(bx + sway, midY, bx + sway * 1.3, waistY - s * 0.02);
+      ctx.stroke();
+      ctx.lineWidth = s * 0.1;
+      ctx.beginPath();
+      ctx.moveTo(bx + sway * 1.2, waistY - s * 0.12);
+      ctx.quadraticCurveTo(bx + sway * 1.7, waistY + s * 0.04, bx + sway * 1.5, waistY + s * 0.14);
+      ctx.stroke();
+    } else if (style === "braid") {
+      // central braid: a base line plus stacked beads down its length
+      const tipX = bx + sway * 1.2, tipY = waistY - s * 0.02;
+      ctx.lineWidth = s * 0.09;
+      ctx.beginPath();
+      ctx.moveTo(bx, headCY - rH * 0.2);
+      ctx.quadraticCurveTo(bx + sway, midY, tipX, tipY);
+      ctx.stroke();
+      ctx.fillStyle = hairCol;
+      const beads = 5;
+      for (let i = 0; i <= beads; i++) {
+        const t = i / beads;
+        const x = (1 - t) * (1 - t) * bx + 2 * (1 - t) * t * (bx + sway) + t * t * tipX;
+        const y = (1 - t) * (1 - t) * (headCY - rH * 0.2) + 2 * (1 - t) * t * midY + t * t * tipY;
+        const rr = s * (0.16 - 0.09 * t);
+        ctx.beginPath(); ctx.ellipse(x, y, rr, rr * 0.8, 0, 0, Math.PI * 2); ctx.fill();
+      }
+      // tie at the tip (accent)
+      ctx.fillStyle = sk.cap;
+      ctx.beginPath(); ctx.arc(tipX, tipY, s * 0.055, 0, Math.PI * 2); ctx.fill();
+    } else if (style === "pigtails") {
+      ctx.lineWidth = s * 0.15;
+      for (const dir of [-1, 1]) {
+        const sx = bx + dir * rH * 0.7, sy = headCY + rH * 0.05;
+        const ex = bx + dir * (rH * 1.1) + sway * dir * 0.6, ey = waistY - s * 0.06;
+        ctx.beginPath();
+        ctx.moveTo(sx, sy);
+        ctx.quadraticCurveTo(bx + dir * rH * 1.3, midY, ex, ey);
+        ctx.stroke();
+      }
+    } else if (style === "bob") {
+      // short hair: rounded flip just below the head, no long tail
+      ctx.fillStyle = hairCol;
+      ctx.beginPath(); ctx.ellipse(bx, headCY + rH * 0.5, rH * 1.05, rH * 0.7, 0, 0, Math.PI * 2); ctx.fill();
+    } else if (style === "buns") {
+      // barely any hang; small nape tuft
+      ctx.fillStyle = hairCol;
+      ctx.beginPath(); ctx.ellipse(bx, headCY + rH * 0.45, rH * 0.7, rH * 0.45, 0, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  // Buns / hair-ties that sit on top of the head (drawn after the head)
+  function drawBackHairTop(sk, bx, headCY, rH, s, sway) {
+    const style = sk.style;
+    if (style === "buns") {
+      ctx.fillStyle = sk.hair;
+      for (const dir of [-1, 1]) {
+        ctx.beginPath(); ctx.arc(bx + dir * rH * 0.72, headCY - rH * 0.62, rH * 0.5, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.fillStyle = sk.cap;
+      for (const dir of [-1, 1]) {
+        ctx.beginPath(); ctx.arc(bx + dir * rH * 0.72, headCY - rH * 0.2, s * 0.05, 0, Math.PI * 2); ctx.fill();
+      }
+    } else if (style === "pigtails") {
+      ctx.fillStyle = sk.cap;
+      for (const dir of [-1, 1]) {
+        ctx.beginPath(); ctx.arc(bx + dir * rH * 0.7, headCY + rH * 0.02, s * 0.05, 0, Math.PI * 2); ctx.fill();
+      }
+    } else if (style === "ponytail" || style === "braid") {
+      ctx.fillStyle = sk.cap;
+      ctx.beginPath(); ctx.arc(bx, headCY - rH * 0.2, s * 0.06, 0, Math.PI * 2); ctx.fill();
+    } else if (style === "bob") {
+      // slim headband accent
+      ctx.strokeStyle = sk.cap; ctx.lineWidth = s * 0.05;
+      ctx.beginPath(); ctx.arc(bx, headCY, rH * 0.92, Math.PI * 1.12, Math.PI * 1.88); ctx.stroke();
+    }
+  }
+
+  function drawPlayerGlow(x, y, s) {
+    const glow = SKINS[equipped].glow;
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    const g = ctx.createRadialGradient(x, y, 2, x, y, s * 1.1);
+    g.addColorStop(0, `rgba(${glow},0.18)`);
+    g.addColorStop(1, `rgba(${glow},0)`);
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x, y, s * 1.1, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  function roundRect(x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function drawScene() {
+    // sort far -> near so nearer draws on top; player at z=0
+    const drawList = objects.slice().sort((a, b) => b.z - a.z);
+    let playerDrawn = false;
+    for (const o of drawList) {
+      if (!playerDrawn && o.z <= 0) { drawPlayer(); playerDrawn = true; }
+      if (o.kind === "coin") { if (!o.collected) drawCoin(o); }
+      else if (o.kind === "power") { if (!o.collected) drawPower(o); }
+      else drawObstacle(o);
+    }
+    if (!playerDrawn) drawPlayer();
+  }
+
+  // ---------- HUD & overlays ----------
+  function drawHUD() {
+    ctx.textAlign = "left"; ctx.textBaseline = "top";
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 26px Trebuchet MS";
+    ctx.fillText(String(Math.floor(score)).padStart(6, "0"), 20, 18);
+    ctx.font = "13px Trebuchet MS";
+    ctx.fillStyle = "rgba(255,255,255,0.6)";
+    ctx.fillText("SCORE", 22, 50);
+
+    // coins
+    ctx.textAlign = "right";
+    ctx.fillStyle = "#ffd23f";
+    ctx.font = "bold 24px Trebuchet MS";
+    ctx.fillText("● " + coins, W - 20, 18);
+    ctx.font = "13px Trebuchet MS";
+    ctx.fillStyle = "rgba(255,255,255,0.6)";
+    ctx.fillText("BEST " + best, W - 22, 50);
+
+    // speed bar
+    const sp = (speed - 16) / (38 - 16);
+    ctx.fillStyle = "rgba(255,255,255,0.15)";
+    roundRect(W / 2 - 60, 20, 120, 8, 4); ctx.fill();
+    ctx.fillStyle = "#31e0ff";
+    roundRect(W / 2 - 60, 20, 120 * Math.max(0, Math.min(1, sp)), 8, 4); ctx.fill();
+    ctx.textAlign = "center";
+    ctx.fillStyle = "rgba(255,255,255,0.6)";
+    ctx.font = "11px Trebuchet MS";
+    ctx.fillText("SPEED", W / 2, 32);
+
+    // active power-up pills, centered under the speed bar
+    const active = [];
+    if (multT > 0)   active.push({ l: "2×",     t: multT,   m: MULT_TIME,   c: POWER_COL.mult });
+    if (magnetT > 0) active.push({ l: "MAGNET", t: magnetT, m: MAGNET_TIME, c: POWER_COL.magnet });
+    if (shieldOn)    active.push({ l: "SHIELD", t: 1,       m: 1,           c: POWER_COL.shield });
+    const pw = 92, ph = 22, gap = 8;
+    let axStart = W / 2 - (active.length * (pw + gap) - gap) / 2;
+    for (const a of active) {
+      const x = axStart;
+      ctx.fillStyle = "rgba(0,0,0,0.35)";
+      roundRect(x, 46, pw, ph, 6); ctx.fill();
+      // time fill
+      ctx.fillStyle = a.c;
+      const frac = Math.max(0, Math.min(1, a.t / a.m));
+      roundRect(x, 46, pw * frac, ph, 6); ctx.fill();
+      ctx.fillStyle = "#0a0a18";
+      ctx.font = "bold 12px Trebuchet MS";
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(a.l, x + pw / 2, 46 + ph / 2 + 1);
+      ctx.textBaseline = "alphabetic";
+      axStart += pw + gap;
+    }
+  }
+
+  // draw a front-facing cartoon-girl portrait in the given skin (menu preview)
+  function drawSkinPreview(cxp, cyp, r, skinIdx) {
+    const sk = SKINS[skinIdx];
+    // glow halo
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    const g = ctx.createRadialGradient(cxp, cyp, 2, cxp, cyp, r * 1.7);
+    g.addColorStop(0, `rgba(${sk.glow},0.35)`); g.addColorStop(1, `rgba(${sk.glow},0)`);
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cxp, cyp, r * 1.7, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+
+    const headY = cyp - r * 0.35, headR = r * 0.5;
+
+    // hair back layer (all styles have head volume)
+    ctx.fillStyle = sk.hair;
+    ctx.beginPath(); ctx.ellipse(cxp, headY + r * 0.12, headR * 1.16, headR * 1.34, 0, 0, Math.PI * 2); ctx.fill();
+
+    // style-specific hair (drawn behind the face)
+    const style = sk.style;
+    if (style === "pigtails") {
+      ctx.fillStyle = sk.hair;
+      ctx.beginPath(); ctx.ellipse(cxp - headR * 1.05, headY + r * 0.06, headR * 0.34, headR * 0.62, 0.35, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cxp + headR * 1.05, headY + r * 0.06, headR * 0.34, headR * 0.62, -0.35, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = sk.cap;
+      ctx.beginPath(); ctx.arc(cxp - headR * 0.86, headY - headR * 0.1, headR * 0.15, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(cxp + headR * 0.86, headY - headR * 0.1, headR * 0.15, 0, Math.PI * 2); ctx.fill();
+    } else if (style === "ponytail") {
+      // single ponytail sweeping down the right side
+      ctx.fillStyle = sk.hair;
+      ctx.beginPath(); ctx.ellipse(cxp + headR * 1.02, headY + r * 0.2, headR * 0.32, headR * 0.72, -0.25, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = sk.cap;
+      ctx.beginPath(); ctx.arc(cxp + headR * 0.82, headY - headR * 0.18, headR * 0.15, 0, Math.PI * 2); ctx.fill();
+    } else if (style === "braid") {
+      // braid over the left shoulder: stacked beads
+      ctx.fillStyle = sk.hair;
+      for (let i = 0; i < 5; i++) {
+        const rr = headR * (0.36 - 0.045 * i);
+        ctx.beginPath(); ctx.ellipse(cxp - headR * 0.85, headY + headR * (0.2 + i * 0.5), rr, rr * 0.82, 0, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.fillStyle = sk.cap;
+      ctx.beginPath(); ctx.arc(cxp - headR * 0.82, headY - headR * 0.05, headR * 0.15, 0, Math.PI * 2); ctx.fill();
+    } else if (style === "buns") {
+      // twin buns on top
+      ctx.fillStyle = sk.hair;
+      ctx.beginPath(); ctx.arc(cxp - headR * 0.7, headY - headR * 0.85, headR * 0.42, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(cxp + headR * 0.7, headY - headR * 0.85, headR * 0.42, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = sk.cap;
+      ctx.beginPath(); ctx.arc(cxp - headR * 0.7, headY - headR * 0.85, headR * 0.16, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(cxp + headR * 0.7, headY - headR * 0.85, headR * 0.16, 0, Math.PI * 2); ctx.fill();
+    } else if (style === "bob") {
+      // chin-length side pieces framing the face
+      ctx.fillStyle = sk.hair;
+      ctx.beginPath(); ctx.ellipse(cxp - headR * 0.9, headY + headR * 0.25, headR * 0.34, headR * 0.7, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cxp + headR * 0.9, headY + headR * 0.25, headR * 0.34, headR * 0.7, 0, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // shoulders / top
+    ctx.fillStyle = sk.body;
+    roundRect(cxp - r * 0.62, cyp + r * 0.34, r * 1.24, r * 0.72, r * 0.26); ctx.fill();
+    ctx.fillStyle = "rgba(255,255,255,0.12)";
+    roundRect(cxp - r * 0.62, cyp + r * 0.34, r * 1.24, r * 0.14, r * 0.07); ctx.fill();
+
+    // face
+    ctx.fillStyle = "#f4c1a0";
+    ctx.beginPath(); ctx.arc(cxp, headY, headR, 0, Math.PI * 2); ctx.fill();
+
+    // bangs / fringe
+    ctx.fillStyle = sk.hair;
+    ctx.beginPath();
+    ctx.arc(cxp, headY, headR, Math.PI, 0, false);
+    ctx.lineTo(cxp + headR * 0.78, headY + headR * 0.12);
+    ctx.quadraticCurveTo(cxp + headR * 0.25, headY - headR * 0.06, cxp, headY + headR * 0.06);
+    ctx.quadraticCurveTo(cxp - headR * 0.25, headY - headR * 0.06, cxp - headR * 0.78, headY + headR * 0.12);
+    ctx.closePath(); ctx.fill();
+
+    // eyes
+    ctx.fillStyle = "#3a2a2a";
+    ctx.beginPath(); ctx.arc(cxp - headR * 0.33, headY + headR * 0.14, headR * 0.13, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(cxp + headR * 0.33, headY + headR * 0.14, headR * 0.13, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(cxp - headR * 0.29, headY + headR * 0.09, headR * 0.05, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(cxp + headR * 0.37, headY + headR * 0.09, headR * 0.05, 0, Math.PI * 2); ctx.fill();
+
+    // blush
+    ctx.fillStyle = "rgba(255,130,140,0.5)";
+    ctx.beginPath(); ctx.ellipse(cxp - headR * 0.5, headY + headR * 0.36, headR * 0.16, headR * 0.1, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(cxp + headR * 0.5, headY + headR * 0.36, headR * 0.16, headR * 0.1, 0, 0, Math.PI * 2); ctx.fill();
+
+    // smile
+    ctx.strokeStyle = "#b5654a"; ctx.lineWidth = Math.max(1, headR * 0.07); ctx.lineCap = "round";
+    ctx.beginPath(); ctx.arc(cxp, headY + headR * 0.3, headR * 0.22, Math.PI * 0.15, Math.PI * 0.85); ctx.stroke();
+  }
+
+  // skin carousel + currency, used on menu & game-over screens
+  function drawSkinPanel(topY) {
+    const s = SKINS[menuSkin];
+    const ownedThis = owned.includes(menuSkin);
+
+    // coin bank
+    ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = "#ffd23f"; ctx.font = "bold 20px Trebuchet MS";
+    ctx.fillText("● " + bank + " coins", W / 2, topY);
+
+    const py = topY + 60;
+    // arrows
+    ctx.fillStyle = "rgba(255,255,255,0.7)"; ctx.font = "bold 30px Trebuchet MS";
+    ctx.fillText("‹", W / 2 - 110, py + 8);
+    ctx.fillText("›", W / 2 + 110, py + 8);
+
+    drawSkinPreview(W / 2, py - 4, 34, menuSkin);
+
+    ctx.fillStyle = "#fff"; ctx.font = "bold 20px Trebuchet MS";
+    ctx.fillText(s.name, W / 2, py + 66);
+
+    if (ownedThis) {
+      const isEq = menuSkin === equipped;
+      ctx.fillStyle = isEq ? "#31e0ff" : "rgba(255,255,255,0.6)";
+      ctx.font = "14px Trebuchet MS";
+      ctx.fillText(isEq ? "EQUIPPED" : "OWNED — press U to equip", W / 2, py + 90);
+    } else {
+      const afford = bank >= s.cost;
+      ctx.fillStyle = afford ? "#ffd23f" : "rgba(255,120,120,0.9)";
+      ctx.font = "14px Trebuchet MS";
+      ctx.fillText((afford ? "" : "need ") + "● " + s.cost + " — press U to " + (afford ? "buy" : "afford"), W / 2, py + 90);
+    }
+  }
+
+  function panel(title, lines, sub) {
+    ctx.fillStyle = "rgba(6,6,20,0.72)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center";
+
+    ctx.fillStyle = "#31e0ff";
+    ctx.font = "bold 52px Trebuchet MS";
+    ctx.shadowColor = "#31e0ff"; ctx.shadowBlur = 20;
+    ctx.fillText(title, W / 2, H * 0.28);
+    ctx.shadowBlur = 0;
+
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    ctx.font = "18px Trebuchet MS";
+    let y = H * 0.42;
+    for (const l of lines) { ctx.fillText(l, W / 2, y); y += 30; }
+
+    if (sub) {
+      ctx.fillStyle = "#ffd23f";
+      ctx.font = "bold 22px Trebuchet MS";
+      const pulse = 0.6 + 0.4 * Math.sin(performance.now() / 300);
+      ctx.globalAlpha = pulse;
+      ctx.fillText(sub, W / 2, H * 0.72);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function screenTitle(title) {
+    ctx.fillStyle = "rgba(6,6,20,0.74)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = "#31e0ff";
+    ctx.font = "bold 50px Trebuchet MS";
+    ctx.shadowColor = "#31e0ff"; ctx.shadowBlur = 20;
+    ctx.fillText(title, W / 2, H * 0.15);
+    ctx.shadowBlur = 0;
+  }
+
+  function pulseHint(text, y) {
+    ctx.fillStyle = "#ffd23f";
+    ctx.font = "bold 20px Trebuchet MS";
+    ctx.globalAlpha = 0.6 + 0.4 * Math.sin(performance.now() / 300);
+    ctx.textAlign = "center";
+    ctx.fillText(text, W / 2, y);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawMenu() {
+    screenTitle("NEON DASH");
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.font = "15px Trebuchet MS"; ctx.textAlign = "center";
+    ctx.fillText("← → move · ↑/Space jump red · ↓ slide yellow bars · avoid blue trains", W / 2, H * 0.24);
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.font = "13px Trebuchet MS";
+    ctx.fillText("grab power-ups:  M magnet · S shield · 2× score", W / 2, H * 0.29);
+
+    drawSkinPanel(H * 0.40);
+    pulseHint("SPACE / TAP to run   ·   ‹ › browse skins   ·   U buy/equip", H * 0.82);
+  }
+
+  function drawOver() {
+    screenTitle("WIPEOUT!");
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    ctx.font = "18px Trebuchet MS"; ctx.textAlign = "center";
+    ctx.fillText("Score  " + Math.floor(score) + "    Coins  " + coins + "    Best  " + best, W / 2, H * 0.26);
+
+    drawSkinPanel(H * 0.40);
+    pulseHint("SPACE / TAP to run again   ·   ‹ › skins   ·   U buy/equip", H * 0.82);
+  }
+
+  function drawPause() {
+    panel("PAUSED", ["Press P to resume"], "");
+  }
+
+  // ---------- Main loop ----------
+  function frame(now) {
+    let dt = (now - lastT) / 1000;
+    lastT = now;
+    if (dt > 0.05) dt = 0.05; // clamp
+    update(dt);
+
+    ctx.save();
+    if (shake > 0.01) {
+      const m = shake * 14;
+      ctx.translate((Math.random() - 0.5) * m, (Math.random() - 0.5) * m);
+    }
+    drawBackground();
+    drawRoad();
+    drawScene();
+    ctx.restore();
+
+    // coin flash tint
+    if (flash > 0.02) {
+      ctx.fillStyle = `rgba(255,220,90,${flash * 0.18})`;
+      ctx.fillRect(0, 0, W, H);
+    }
+
+    drawHUD();
+    if (state === STATE.MENU) drawMenu();
+    else if (state === STATE.OVER) drawOver();
+    else if (state === STATE.PAUSE) drawPause();
+
+    requestAnimationFrame(frame);
+  }
+
+  resize();
+  reset();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
